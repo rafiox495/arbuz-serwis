@@ -4,30 +4,38 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-iso:
     runs-on: ubuntu-latest
     steps:
-      - name: Instalacja narzedzi
+      - name: Kompilacja ISO w czystym środowisku Debian Bookworm
         run: |
-          sudo apt update
-          sudo DEBIAN_FRONTEND=noninteractive apt install -y \
-            live-build debootstrap isolinux syslinux-common xorriso debian-archive-keyring
+          # 1. Przygotowanie skryptu budującego dla Dockera
+          cat << 'DOCKER_SCRIPT' > build_in_docker.sh
+          #!/bin/bash
+          set -e
 
-      - name: Konfiguracja i budowanie Arbuz Serwis
-        run: |
-          mkdir -p ~/arbuz_build && cd ~/arbuz_build
+          echo "=== [1/4] Instalacja natywnych narzędzi Debiana ==="
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            live-build debootstrap isolinux xorriso squashfs-tools
 
-          # Konfiguracja bazowa (domyślny bootloader tworzy hybrydowy obraz BIOS+UEFI)
-          sudo lb config \
+          mkdir -p /arbuz_workspace
+          cd /arbuz_workspace
+
+          echo "=== [2/4] Konfiguracja live-build ==="
+          lb config \
             --distribution bookworm \
             --architecture amd64 \
             --archive-areas "main contrib non-free non-free-firmware" \
-            --linux-packages "linux-image" \
-            --system live
+            --bootappend-live "boot=live components locales=pl_PL.UTF-8 keyboard-layouts=pl username=root autologin"
 
-          # Lista pakietów
-          sudo mkdir -p config/package-lists
-          cat << 'EOF' | sudo tee config/package-lists/serwis.list.chroot
+          # Lista wszystkich pakietów diagnostycznych, sterowników i GUI
+          mkdir -p config/package-lists
+          cat << 'EOF' > config/package-lists/arbuz.list.chroot
+          linux-image-amd64
+          live-boot
+          live-config
+          live-config-systemd
           firmware-linux
           firmware-linux-nonfree
           smartmontools
@@ -68,18 +76,22 @@ jobs:
           python3-pyqt6
           EOF
 
-          # Struktura katalogów
-          sudo mkdir -p config/includes.chroot/root config/includes.chroot/opt/arbuz
+          echo "=== [3/4] Konfiguracja autostartu i aplikacji Arbuz Serwis ==="
+          mkdir -p config/includes.chroot/etc/skel
+          mkdir -p config/includes.chroot/root
+          mkdir -p config/includes.chroot/opt/arbuz
 
-          # Autostart serwera X
-          cat << 'EOF' | sudo tee config/includes.chroot/root/.bash_profile
+          # Autostart serwera graficznego po zalogowaniu na tty1
+          cat << 'EOF' > config/includes.chroot/root/.bash_profile
           if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
               exec startx
           fi
           EOF
+          cp config/includes.chroot/root/.bash_profile config/includes.chroot/etc/skel/.bash_profile
 
-          # Autostart Kiosku
-          cat << 'EOF' | sudo tee config/includes.chroot/root/.xinitrc
+          # Start Kiosku (Openbox + Arbuz Serwis)
+          cat << 'EOF' > config/includes.chroot/root/.xinitrc
+          #!/bin/sh
           xset -dpms
           xset s off
           unclutter -idle 3 &
@@ -88,9 +100,11 @@ jobs:
           cd /opt/arbuz
           python3 /opt/arbuz/arbuz_app.py
           EOF
+          chmod +x config/includes.chroot/root/.xinitrc
+          cp config/includes.chroot/root/.xinitrc config/includes.chroot/etc/skel/.xinitrc
 
-          # Pelny kod aplikacji Arbuz Serwis (Wsparcie Windows, Linux, Diagnoza, Hasla)
-          cat << 'EOF' | sudo tee config/includes.chroot/opt/arbuz/arbuz_app.py
+          # Kompletna aplikacja Arbuz Serwis w Pythonie
+          cat << 'EOF' > config/includes.chroot/opt/arbuz/arbuz_app.py
           import sys, os, subprocess, re
           from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                                        QVBoxLayout, QLabel, QPushButton, QStackedWidget, 
@@ -365,13 +379,26 @@ jobs:
               sys.exit(app.exec())
           EOF
 
-          # Budowanie ISO
-          sudo lb build
-          sudo mv live-image-amd64*.iso ArbuzSerwis.iso 2>/dev/null || sudo mv *.iso ArbuzSerwis.iso 2>/dev/null
-          sudo chmod 644 ArbuzSerwis.iso
+          echo "=== [4/4] Kompilacja ISO ==="
+          lb build
+
+          cp live-image-amd64*.iso /output/ArbuzSerwis.iso
+          chmod 666 /output/ArbuzSerwis.iso
+          echo "ISO gotowe do pobrania!"
+          DOCKER_SCRIPT
+
+          chmod +x build_in_docker.sh
+          mkdir -p ${{ github.workspace }}/output
+
+          # 2. Uruchomienie budowy w oficjalnym kontenerze Debian Bookworm
+          docker run --rm --privileged \
+            -v ${{ github.workspace }}/build_in_docker.sh:/build_in_docker.sh \
+            -v ${{ github.workspace }}/output:/output \
+            debian:bookworm /build_in_docker.sh
 
       - name: Udostępnij plik ISO do pobrania
         uses: actions/upload-artifact@v4
         with:
           name: ArbuzSerwis-ISO
-          path: ~/arbuz_build/ArbuzSerwis.iso
+          path: ${{ github.workspace }}/output/ArbuzSerwis.iso
+          retention-days: 7
