@@ -12,14 +12,16 @@ jobs:
           sudo apt update
           sudo apt install -y live-build debootstrap isolinux syslinux xorriso
 
-      - name: Konfiguracja i budowa
+      - name: Konfiguracja i budowanie Arbuz Serwis
         run: |
           mkdir -p ~/arbuz_build && cd ~/arbuz_build
+
+          # Konfiguracja bazowa Debian Bookworm (UEFI + BIOS Legacy)
           sudo lb config \
             --distribution bookworm \
             --architecture amd64 \
             --archive-areas "main contrib non-free non-free-firmware" \
-            --bootloaders "syslinux,grub-efi" \
+            --bootloader "syslinux,grub-efi" \
             --linux-packages "linux-image" \
             --system live
 
