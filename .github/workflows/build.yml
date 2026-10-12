@@ -1,0 +1,128 @@
+name: Buduj Arbuz Serwis ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instalacja narzedzi
+        run: |
+          sudo apt update
+          sudo apt install -y live-build debootstrap isolinux syslinux xorriso
+
+      - name: Konfiguracja i budowa
+        run: |
+          mkdir -p ~/arbuz_build && cd ~/arbuz_build
+          sudo lb config \
+            --distribution bookworm \
+            --architecture amd64 \
+            --archive-areas "main contrib non-free non-free-firmware" \
+            --bootloaders "syslinux,grub-efi" \
+            --linux-packages "linux-image" \
+            --system live
+
+          sudo mkdir -p config/package-lists
+          cat << 'EOF' | sudo tee config/package-lists/serwis.list.chroot
+          firmware-linux
+          firmware-linux-nonfree
+          smartmontools
+          nvme-cli
+          pciutils
+          usbutils
+          dmidecode
+          lshw
+          acpi
+          acpid
+          lm-sensors
+          ntfs-3g
+          btrfs-progs
+          xfsprogs
+          chntpw
+          hivex
+          libhivex-bin
+          cabextract
+          network-manager
+          wireless-tools
+          wpasupplicant
+          chromium
+          chromium-l10n
+          xorg
+          xinit
+          openbox
+          xterm
+          unclutter
+          python3
+          python3-pyqt6
+          EOF
+
+          sudo mkdir -p config/includes.chroot/root config/includes.chroot/opt/arbuz
+
+          cat << 'EOF' | sudo tee config/includes.chroot/root/.bash_profile
+          if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+              exec startx
+          fi
+          EOF
+
+          cat << 'EOF' | sudo tee config/includes.chroot/root/.xinitrc
+          xset -dpms
+          xset s off
+          unclutter -idle 3 &
+          openbox &
+          cd /opt/arbuz
+          python3 arbuz_app.py
+          EOF
+
+          # Pobranie kodu aplikacji Arbuz
+          cat << 'EOF' | sudo tee config/includes.chroot/opt/arbuz/arbuz_app.py
+          import sys, os, subprocess
+          from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QStackedWidget
+          from PyQt6.QtCore import Qt
+
+          class App(QMainWindow):
+              def __init__(self):
+                  super().__init__()
+                  self.setWindowTitle("Arbuz Serwis")
+                  self.showFullScreen()
+                  self.setStyleSheet("background-color: #0b0f14; color: white;")
+                  cw = QWidget()
+                  self.setCentralWidget(cw)
+                  lay = QHBoxLayout(cw)
+                  side = QWidget()
+                  side.setFixedWidth(240)
+                  side.setStyleSheet("background: #0e1217;")
+                  s_lay = QVBoxLayout(side)
+                  l = QLabel("🍉 ARBUZ SERWIS")
+                  l.setStyleSheet("color: #2ecc71; font-size: 20px; font-weight: bold; padding: 15px;")
+                  s_lay.addWidget(l)
+                  
+                  btn_t = QPushButton("💻 Terminal")
+                  btn_t.clicked.connect(lambda: os.system("xterm &"))
+                  btn_r = QPushButton("🔄 Restart")
+                  btn_r.clicked.connect(lambda: os.system("reboot"))
+                  btn_o = QPushButton("⏻ Wylacz")
+                  btn_o.clicked.connect(lambda: os.system("poweroff"))
+                  for b in [btn_t, btn_r, btn_o]:
+                      b.setStyleSheet("padding: 10px; font-weight: bold; text-align: left;")
+                      s_lay.addWidget(b)
+                  s_lay.addStretch()
+                  lay.addWidget(side)
+                  self.cnt = QLabel("Skanowanie sprzetu...")
+                  lay.addWidget(self.cnt)
+
+          if __name__ == "__main__":
+              a = QApplication(sys.argv)
+              w = App()
+              w.show()
+              sys.exit(a.exec())
+          EOF
+
+          sudo lb build
+          sudo mv live-image-amd64.hybrid.iso ArbuzSerwis.iso
+
+      - name: Udostępnij plik ISO do pobrania
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArbuzSerwis-ISO
+          path: ~/arbuz_build/ArbuzSerwis.iso
