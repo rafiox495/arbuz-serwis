@@ -7,27 +7,36 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Instalacja narzedzi
+      - name: Instalacja narzedzi na maszynie bazowej
         run: |
           sudo apt update
           sudo DEBIAN_FRONTEND=noninteractive apt install -y \
             live-build debootstrap isolinux syslinux-common xorriso debian-archive-keyring
 
-      - name: Konfiguracja i budowanie Arbuz Serwis
+      - name: Konfiguracja i kompilacja Arbuz Serwis
         run: |
-          mkdir -p ~/arbuz_build && cd ~/arbuz_build
+          BUILD_DIR="$HOME/arbuz_build"
+          rm -rf "$BUILD_DIR"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
 
-          # Konfiguracja bazowa (domyślny bootloader tworzy hybrydowy obraz BIOS+UEFI)
+          # Wymuszenie trybu Debiana i oficjalnych serwerów deb.debian.org
           sudo lb config \
+            --mode debian \
             --distribution bookworm \
             --architecture amd64 \
             --archive-areas "main contrib non-free non-free-firmware" \
-            --linux-packages "linux-image" \
-            --system live
+            --mirror-bootstrap "http://deb.debian.org/debian/" \
+            --mirror-chroot "http://deb.debian.org/debian/" \
+            --mirror-binary "http://deb.debian.org/debian/" \
+            --bootappend-live "boot=live components locales=pl_PL.UTF-8 keyboard-layouts=pl username=root autologin"
 
-          # Lista pakietów
+          # Lista wszystkich pakietów diagnostycznych i sterowników
           sudo mkdir -p config/package-lists
           cat << 'EOF' | sudo tee config/package-lists/serwis.list.chroot
+          linux-image-amd64
+          live-boot
+          live-config
           firmware-linux
           firmware-linux-nonfree
           smartmontools
@@ -48,7 +57,6 @@ jobs:
           parted
           testdisk
           chntpw
-          hivex
           libhivex-bin
           cabextract
           network-manager
@@ -68,18 +76,19 @@ jobs:
           python3-pyqt6
           EOF
 
-          # Struktura katalogów
+          # Struktura katalogów dla autostartu
           sudo mkdir -p config/includes.chroot/root config/includes.chroot/opt/arbuz
 
-          # Autostart serwera X
+          # Autostart serwera graficznego po zalogowaniu na konsoli
           cat << 'EOF' | sudo tee config/includes.chroot/root/.bash_profile
           if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
               exec startx
           fi
           EOF
 
-          # Autostart Kiosku
+          # Start Kiosku (Openbox + Arbuz Serwis)
           cat << 'EOF' | sudo tee config/includes.chroot/root/.xinitrc
+          #!/bin/sh
           xset -dpms
           xset s off
           unclutter -idle 3 &
@@ -88,8 +97,9 @@ jobs:
           cd /opt/arbuz
           python3 /opt/arbuz/arbuz_app.py
           EOF
+          sudo chmod +x config/includes.chroot/root/.xinitrc
 
-          # Pelny kod aplikacji Arbuz Serwis (Wsparcie Windows, Linux, Diagnoza, Hasla)
+          # Kompletna aplikacja Arbuz Serwis (Multi-OS, Doradca, Hasła, Licencje)
           cat << 'EOF' | sudo tee config/includes.chroot/opt/arbuz/arbuz_app.py
           import sys, os, subprocess, re
           from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
@@ -156,7 +166,7 @@ jobs:
                       if ed > 0 and ef > 0:
                           w = round((1 - (ef/ed))*100, 1)
                           if w >= 50: tips.append(("CRITICAL", "Bateria: Skrajne zużycie ogniw", f"Poziom zużycia: {w}%. Ryzyko spuchnięcia. Wymień baterię."))
-                          elif w >= 30: tips.append(("WARNING", "Bateria: Wyeksploatowana", f"Poziom zużycia: {w}%. Skrócony czas pracy na akumulatorze."))
+                          elif w >= 30: tips.append(("WARNING", "Bateria: Zużyta", f"Poziom zużycia: {w}%. Skrócony czas pracy na akumulatorze."))
                           else: tips.append(("OK", "Bateria: Sprawna", f"Poziom zużycia: {w}%."))
                   try:
                       ls = subprocess.check_output("lsblk -dno NAME,TYPE", shell=True).decode()
@@ -189,7 +199,7 @@ jobs:
                   cw = QWidget(); self.setCentralWidget(cw)
                   root = QVBoxLayout(cw); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
 
-                  # Top bar (Multi-OS)
+                  # Pasek wyboru systemu
                   tb = QWidget(); tb.setStyleSheet("background: #121820; border-bottom: 1px solid #1f2733; padding: 6px;")
                   tbl = QHBoxLayout(tb)
                   tbl.addWidget(QLabel("🎯 <b>SYSTEM DO NAPRAWY:</b>"))
@@ -204,7 +214,7 @@ jobs:
                   tbl.addStretch()
                   root.addWidget(tb)
 
-                  # Body
+                  # Menu boczne
                   b = QWidget(); bl = QHBoxLayout(b); bl.setContentsMargins(0,0,0,0); bl.setSpacing(0)
                   side = QWidget(); side.setFixedWidth(240); side.setStyleSheet("background: #0e1217; border-right: 1px solid #1f2733;")
                   sl = QVBoxLayout(side)
@@ -365,13 +375,16 @@ jobs:
               sys.exit(app.exec())
           EOF
 
-          # Budowanie ISO
+          # Budowanie gotowego obrazu ISO
           sudo lb build
-          sudo mv live-image-amd64*.iso ArbuzSerwis.iso 2>/dev/null || sudo mv *.iso ArbuzSerwis.iso 2>/dev/null
-          sudo chmod 644 ArbuzSerwis.iso
+
+          # Skopiowanie wygenerowanego pliku do katalogu roboczego
+          sudo cp live-image-amd64*.iso ${{ github.workspace }}/ArbuzSerwis.iso
+          sudo chmod 666 ${{ github.workspace }}/ArbuzSerwis.iso
 
       - name: Udostępnij plik ISO do pobrania
         uses: actions/upload-artifact@v4
         with:
           name: ArbuzSerwis-ISO
-          path: ~/arbuz_build/ArbuzSerwis.iso
+          path: ArbuzSerwis.iso
+          retention-days: 7
