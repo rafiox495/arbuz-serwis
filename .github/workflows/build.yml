@@ -10,21 +10,22 @@ jobs:
       - name: Instalacja narzedzi
         run: |
           sudo apt update
-          sudo apt install -y live-build debootstrap isolinux syslinux xorriso
+          sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+            live-build debootstrap isolinux syslinux-common xorriso debian-archive-keyring
 
       - name: Konfiguracja i budowanie Arbuz Serwis
         run: |
           mkdir -p ~/arbuz_build && cd ~/arbuz_build
 
-          # Konfiguracja bazowa Debian Bookworm (UEFI + BIOS Legacy)
+          # Konfiguracja bazowa (domyślny bootloader tworzy hybrydowy obraz BIOS+UEFI)
           sudo lb config \
             --distribution bookworm \
             --architecture amd64 \
             --archive-areas "main contrib non-free non-free-firmware" \
-            --bootloader "syslinux,grub-efi" \
             --linux-packages "linux-image" \
             --system live
 
+          # Lista pakietów
           sudo mkdir -p config/package-lists
           cat << 'EOF' | sudo tee config/package-lists/serwis.list.chroot
           firmware-linux
@@ -41,6 +42,11 @@ jobs:
           ntfs-3g
           btrfs-progs
           xfsprogs
+          f2fs-tools
+          dosfstools
+          e2fsprogs
+          parted
+          testdisk
           chntpw
           hivex
           libhivex-bin
@@ -50,6 +56,9 @@ jobs:
           wpasupplicant
           chromium
           chromium-l10n
+          ca-certificates
+          curl
+          wget
           xorg
           xinit
           openbox
@@ -59,69 +68,307 @@ jobs:
           python3-pyqt6
           EOF
 
+          # Struktura katalogów
           sudo mkdir -p config/includes.chroot/root config/includes.chroot/opt/arbuz
 
+          # Autostart serwera X
           cat << 'EOF' | sudo tee config/includes.chroot/root/.bash_profile
           if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
               exec startx
           fi
           EOF
 
+          # Autostart Kiosku
           cat << 'EOF' | sudo tee config/includes.chroot/root/.xinitrc
           xset -dpms
           xset s off
           unclutter -idle 3 &
           openbox &
+          mkdir -p /media/ARBUZ_DATA/Pobrane
           cd /opt/arbuz
-          python3 arbuz_app.py
+          python3 /opt/arbuz/arbuz_app.py
           EOF
 
-          # Pobranie kodu aplikacji Arbuz
+          # Pelny kod aplikacji Arbuz Serwis (Wsparcie Windows, Linux, Diagnoza, Hasla)
           cat << 'EOF' | sudo tee config/includes.chroot/opt/arbuz/arbuz_app.py
-          import sys, os, subprocess
-          from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QStackedWidget
-          from PyQt6.QtCore import Qt
+          import sys, os, subprocess, re
+          from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
+                                       QVBoxLayout, QLabel, QPushButton, QStackedWidget, 
+                                       QTableWidget, QTableWidgetItem, QHeaderView, 
+                                       QMessageBox, QFrame, QComboBox, QScrollArea)
+          from PyQt6.QtCore import Qt, QTimer
 
-          class App(QMainWindow):
+          class MultiOS:
+              @staticmethod
+              def scan():
+                  detected = []
+                  try:
+                      out = subprocess.check_output("lsblk -rno NAME,FSTYPE,SIZE", shell=True).decode()
+                      for line in out.splitlines():
+                          pts = line.split()
+                          if len(pts) >= 2 and pts[1] in ["ntfs", "ext4", "btrfs", "xfs"]:
+                              dev, fs, sz = pts[0], pts[1], (pts[2] if len(pts)>2 else "")
+                              mp = f"/mnt/target_{dev}"
+                              os.makedirs(mp, exist_ok=True)
+                              opts = "-o rw,remove_hiberfile" if fs == "ntfs" else "-o rw"
+                              if subprocess.run(f"mount {opts} /dev/{dev} {mp} 2>/dev/null", shell=True).returncode == 0:
+                                  if os.path.exists(os.path.join(mp, "Windows/System32")):
+                                      detected.append({"type": "WINDOWS", "name": f"Windows ({dev})", "mount": mp, "size": sz, "dev": f"/dev/{dev}"})
+                                      continue
+                                  if os.path.exists(os.path.join(mp, "etc/os-release")):
+                                      p_name = "Linux"
+                                      for l in open(os.path.join(mp, "etc/os-release")):
+                                          if l.startswith("PRETTY_NAME="): p_name = l.split("=")[1].strip().strip('"')
+                                      detected.append({"type": "LINUX", "name": f"{p_name} ({dev})", "mount": mp, "size": sz, "dev": f"/dev/{dev}"})
+                                      continue
+                                  subprocess.run(f"umount {mp} 2>/dev/null", shell=True)
+                  except: pass
+                  return detected
+
+              @staticmethod
+              def reset_pwd(target, user):
+                  if target["type"] == "LINUX":
+                      sf = os.path.join(target["mount"], "etc/shadow")
+                      lines = open(sf).readlines()
+                      new_l = []
+                      for l in lines:
+                          p = l.split(":")
+                          if p[0] == user: p[1] = ""; new_l.append(":".join(p))
+                          else: new_l.append(l)
+                      open(sf, "w").writelines(new_l)
+                      subprocess.run("sync", shell=True)
+                      return True, f"Hasło dla {user} w Linuksie skasowane pomyślnie."
+                  elif target["type"] == "WINDOWS":
+                      sam = os.path.join(target["mount"], "Windows/System32/config/SAM")
+                      p = subprocess.Popen(["chntpw", "-u", user, sam], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                      p.communicate(input="1\n2\nq\ny\n")
+                      subprocess.run("sync", shell=True)
+                      return True, f"Hasło Windows dla {user} skasowane pomyślnie."
+
+          class Advisor:
+              @staticmethod
+              def get_tips():
+                  tips = []
+                  b = "/sys/class/power_supply/BAT0" if os.path.exists("/sys/class/power_supply/BAT0") else "/sys/class/power_supply/BAT1"
+                  if os.path.exists(b):
+                      def rv(f): p=os.path.join(b, f); return int(open(p).read().strip()) if os.path.exists(p) else 0
+                      ef, ed = rv("energy_full") or rv("charge_full"), rv("energy_full_design") or rv("charge_full_design")
+                      if ed > 0 and ef > 0:
+                          w = round((1 - (ef/ed))*100, 1)
+                          if w >= 50: tips.append(("CRITICAL", "Bateria: Skrajne zużycie ogniw", f"Poziom zużycia: {w}%. Ryzyko spuchnięcia. Wymień baterię."))
+                          elif w >= 30: tips.append(("WARNING", "Bateria: Wyeksploatowana", f"Poziom zużycia: {w}%. Skrócony czas pracy na akumulatorze."))
+                          else: tips.append(("OK", "Bateria: Sprawna", f"Poziom zużycia: {w}%."))
+                  try:
+                      ls = subprocess.check_output("lsblk -dno NAME,TYPE", shell=True).decode()
+                      for l in ls.splitlines():
+                          p = l.split()
+                          if len(p)>=2 and p[1]=="disk" and "loop" not in p[0]:
+                              d = f"/dev/{p[0]}"
+                              if "nvme" in d:
+                                  o = subprocess.check_output(f"smartctl -a {d} 2>/dev/null || true", shell=True).decode()
+                                  u = re.search(r"Percentage Used:\s+(\d+)%", o)
+                                  if u and int(u.group(1)) >= 85: tips.append(("CRITICAL", f"NVMe ({d}): Zużycie NAND", f"Stopień zużycia komórek: {u.group(1)}%. Wymień dysk."))
+                              else:
+                                  o = subprocess.check_output(f"smartctl -A {d} 2>/dev/null || true", shell=True).decode()
+                                  r = re.search(r"^\s*5\s+Reallocated_Sector_Ct.*?(\d+)\s*$", o, re.M)
+                                  if r and int(r.group(1)) > 0: tips.append(("CRITICAL", f"SATA ({d}): Fizyczne Bad Sektory", f"{r.group(1)} realokowanych sektorów. Dysk do pilnej wymiany!"))
+                  except: pass
+                  try:
+                      so = subprocess.check_output("sensors 2>/dev/null || true", shell=True).decode()
+                      tm = [int(x) for x in re.findall(r"\+(\d+)\.\d+°C", so)]
+                      if tm and max(tm) >= 85: tips.append(("CRITICAL", f"Chłodzenie: Przegrzewanie ({max(tm)}°C)", "Pasta termoprzewodząca skamieniała lub żeberka radiatora zapchane kurzem."))
+                  except: pass
+                  return tips
+
+          class ArbuzGUI(QMainWindow):
               def __init__(self):
                   super().__init__()
                   self.setWindowTitle("Arbuz Serwis")
                   self.showFullScreen()
                   self.setStyleSheet("background-color: #0b0f14; color: white;")
-                  cw = QWidget()
-                  self.setCentralWidget(cw)
-                  lay = QHBoxLayout(cw)
-                  side = QWidget()
-                  side.setFixedWidth(240)
-                  side.setStyleSheet("background: #0e1217;")
-                  s_lay = QVBoxLayout(side)
-                  l = QLabel("🍉 ARBUZ SERWIS")
-                  l.setStyleSheet("color: #2ecc71; font-size: 20px; font-weight: bold; padding: 15px;")
-                  s_lay.addWidget(l)
-                  
-                  btn_t = QPushButton("💻 Terminal")
-                  btn_t.clicked.connect(lambda: os.system("xterm &"))
-                  btn_r = QPushButton("🔄 Restart")
-                  btn_r.clicked.connect(lambda: os.system("reboot"))
-                  btn_o = QPushButton("⏻ Wylacz")
-                  btn_o.clicked.connect(lambda: os.system("poweroff"))
-                  for b in [btn_t, btn_r, btn_o]:
-                      b.setStyleSheet("padding: 10px; font-weight: bold; text-align: left;")
-                      s_lay.addWidget(b)
-                  s_lay.addStretch()
-                  lay.addWidget(side)
-                  self.cnt = QLabel("Skanowanie sprzetu...")
-                  lay.addWidget(self.cnt)
+                  cw = QWidget(); self.setCentralWidget(cw)
+                  root = QVBoxLayout(cw); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+
+                  # Top bar (Multi-OS)
+                  tb = QWidget(); tb.setStyleSheet("background: #121820; border-bottom: 1px solid #1f2733; padding: 6px;")
+                  tbl = QHBoxLayout(tb)
+                  tbl.addWidget(QLabel("🎯 <b>SYSTEM DO NAPRAWY:</b>"))
+                  self.combo = QComboBox()
+                  self.combo.setStyleSheet("background: #1a222d; color: #2ecc71; font-weight: bold; padding: 5px;")
+                  self.combo.currentIndexChanged.connect(self.os_changed)
+                  tbl.addWidget(self.combo)
+                  btn_r = QPushButton("🔄 Skanuj dyski")
+                  btn_r.setStyleSheet("background: #27ae60; color: white; padding: 5px 10px;")
+                  btn_r.clicked.connect(self.load_systems)
+                  tbl.addWidget(btn_r)
+                  tbl.addStretch()
+                  root.addWidget(tb)
+
+                  # Body
+                  b = QWidget(); bl = QHBoxLayout(b); bl.setContentsMargins(0,0,0,0); bl.setSpacing(0)
+                  side = QWidget(); side.setFixedWidth(240); side.setStyleSheet("background: #0e1217; border-right: 1px solid #1f2733;")
+                  sl = QVBoxLayout(side)
+                  l_logo = QLabel("🍉 ARBUZ SERWIS"); l_logo.setStyleSheet("color: #2ecc71; font-size: 20px; font-weight: bold; padding: 15px;")
+                  sl.addWidget(l_logo)
+                  self.l_chassis = QLabel("Wykrywanie...")
+                  self.l_chassis.setStyleSheet("color: #00bcd4; font-weight: bold; padding-left: 15px;")
+                  sl.addWidget(self.l_chassis)
+
+                  btn_a = QPushButton("🧠 Diagnoza & Zużycie"); btn_a.clicked.connect(lambda: self.st.setCurrentIndex(0))
+                  btn_p = QPushButton("🔑 Hasła Win/Linux"); btn_p.clicked.connect(lambda: self.st.setCurrentIndex(1))
+                  btn_d = QPushButton("🚗 Sterowniki & Licencja"); btn_d.clicked.connect(lambda: self.st.setCurrentIndex(2))
+                  btn_b = QPushButton("🌐 Przeglądarka"); btn_b.clicked.connect(lambda: subprocess.Popen("chromium --no-sandbox https://google.pl &", shell=True))
+                  btn_t = QPushButton("💻 Terminal"); btn_t.clicked.connect(lambda: subprocess.Popen("xterm &", shell=True))
+                  btn_rb = QPushButton("🔄 Restart"); btn_rb.clicked.connect(lambda: os.system("reboot"))
+                  btn_po = QPushButton("⏻ Wyłącz"); btn_po.clicked.connect(lambda: os.system("poweroff"))
+
+                  for bt in [btn_a, btn_p, btn_d, btn_b, btn_t]:
+                      bt.setStyleSheet("text-align: left; padding: 10px 15px; font-weight: bold; border: none; color: #a0aec0;")
+                      sl.addWidget(bt)
+                  sl.addStretch()
+                  sl.addWidget(btn_rb); sl.addWidget(btn_po)
+                  bl.addWidget(side)
+
+                  self.st = QStackedWidget()
+                  self.st.setStyleSheet("background: #0b0f14; padding: 15px;")
+                  self.p_adv = self.create_adv_page()
+                  self.p_pwd = self.create_pwd_page()
+                  self.p_drv = self.create_drv_page()
+                  self.st.addWidget(self.p_adv); self.st.addWidget(self.p_pwd); self.st.addWidget(self.p_drv)
+                  bl.addWidget(self.st)
+                  root.addWidget(b)
+
+                  self.tm = QTimer(); self.tm.timeout.connect(self.live_hw); self.tm.start(2000)
+                  self.load_systems()
+
+              def live_hw(self):
+                  try:
+                      c = open("/sys/class/dmi/id/chassis_type").read().strip()
+                      self.l_chassis.setText("💻 LAPTOP" if c in ["8","9","10","14","30"] else "🖥️ KOMPUTER PC")
+                  except: pass
+
+              def load_systems(self):
+                  self.combo.clear()
+                  self.systems = MultiOS.scan()
+                  if not self.systems: self.combo.addItem("Brak zainstalowanych systemów"); self.cur_sys = None
+                  else:
+                      for s in self.systems: self.combo.addItem(f"{s['name']} [{s['size']}]")
+                      self.cur_sys = self.systems[0]
+                  self.refresh_all()
+
+              def os_changed(self, i):
+                  if 0 <= i < len(self.systems): self.cur_sys = self.systems[i]; self.refresh_all()
+
+              def refresh_all(self):
+                  self.refresh_adv()
+                  self.refresh_pwd()
+                  self.refresh_drv()
+
+              def create_adv_page(self):
+                  w = QWidget(); l = QVBoxLayout(w)
+                  l.addWidget(QLabel("<h2>🧠 Diagnoza Zużycia i Uszkodzeń</h2>"))
+                  self.scr = QScrollArea(); self.scr.setWidgetResizable(True); self.scr.setStyleSheet("border:none;")
+                  self.con = QWidget(); self.cl = QVBoxLayout(self.con); self.scr.setWidget(self.con)
+                  l.addWidget(self.scr); return w
+
+              def refresh_adv(self):
+                  while self.cl.count():
+                      it = self.cl.takeAt(0)
+                      if it.widget(): it.widget().deleteLater()
+                  for lvl, t, m in Advisor.get_tips():
+                      f = QFrame()
+                      col = "#e74c3c" if lvl=="CRITICAL" else ("#f39c12" if lvl=="WARNING" else "#2ecc71")
+                      f.setStyleSheet(f"background:#121820; border-left: 5px solid {col}; padding: 10px; margin-bottom: 6px;")
+                      fl = QVBoxLayout(f)
+                      tl = QLabel(f"<b>[{lvl}] {t}</b>"); tl.setStyleSheet(f"color: {col}; font-size: 14px;")
+                      ml = QLabel(m); ml.setStyleSheet("color: white; font-size: 13px;"); ml.setWordWrap(True)
+                      fl.addWidget(tl); fl.addWidget(ml); self.cl.addWidget(f)
+                  self.cl.addStretch()
+
+              def create_pwd_page(self):
+                  w = QWidget(); l = QVBoxLayout(w)
+                  l.addWidget(QLabel("<h2>🔑 Konta i Reset Haseł (Bez Utraty Danych)</h2>"))
+                  self.tb_p = QTableWidget(); self.tb_p.setColumnCount(2)
+                  self.tb_p.setHorizontalHeaderLabels(["Użytkownik", "Typ konta"])
+                  self.tb_p.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                  self.tb_p.setStyleSheet("background: #0e1217;")
+                  l.addWidget(self.tb_p)
+                  btn = QPushButton("🔓 Skasuj hasło wybranego konta")
+                  btn.setStyleSheet("background: #27ae60; color: white; padding: 10px; font-weight: bold;")
+                  btn.clicked.connect(self.do_pwd_reset)
+                  l.addWidget(btn); return w
+
+              def refresh_pwd(self):
+                  self.tb_p.setRowCount(0)
+                  if not self.cur_sys: return
+                  usrs = []
+                  if self.cur_sys["type"] == "LINUX":
+                      pf = os.path.join(self.cur_sys["mount"], "etc/passwd")
+                      if os.path.exists(pf):
+                          for l in open(pf):
+                              p = l.strip().split(":")
+                              if len(p)>=3 and (p[0]=="root" or (p[2].isdigit() and 1000<=int(p[2])<60000)): usrs.append((p[0], "Linux User"))
+                  elif self.cur_sys["type"] == "WINDOWS":
+                      sam = os.path.join(self.cur_sys["mount"], "Windows/System32/config/SAM")
+                      try:
+                          o = subprocess.check_output(f"chntpw -l '{sam}'", shell=True).decode()
+                          for l in o.splitlines():
+                              if "|" in l and "ADMIN" in l.upper(): usrs.append((l.split("|")[1].strip(), "Administrator"))
+                              elif "|" in l: usrs.append((l.split("|")[1].strip(), "Standard"))
+                      except: pass
+                  self.tb_p.setRowCount(len(usrs))
+                  for r, (u, t) in enumerate(usrs):
+                      self.tb_p.setItem(r, 0, QTableWidgetItem(u))
+                      self.tb_p.setItem(r, 1, QTableWidgetItem(t))
+
+              def do_pwd_reset(self):
+                  r = self.tb_p.currentRow()
+                  if r < 0 or not self.cur_sys: return
+                  u = self.tb_p.item(r, 0).text()
+                  ok, msg = MultiOS.reset_pwd(self.cur_sys, u)
+                  if ok: QMessageBox.information(self, "Gotowe", msg); self.refresh_pwd()
+                  else: QMessageBox.critical(self, "Błąd", msg)
+
+              def create_drv_page(self):
+                  w = QWidget(); l = QVBoxLayout(w)
+                  l.addWidget(QLabel("<h2>🚗 Sterowniki i Licencja</h2>"))
+                  self.l_lic = QLabel("Odczyt licencji...")
+                  self.l_lic.setStyleSheet("background: #121820; padding: 10px; border-radius: 5px; color: #00bcd4;")
+                  l.addWidget(self.l_lic)
+                  self.tb_d = QTableWidget(); self.tb_d.setColumnCount(2)
+                  self.tb_d.setHorizontalHeaderLabels(["Urządzenie", "Hardware ID"])
+                  self.tb_d.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                  self.tb_d.setStyleSheet("background: #0e1217;")
+                  l.addWidget(self.tb_d); return w
+
+              def refresh_drv(self):
+                  k = "Brak"
+                  if os.path.exists("/sys/firmware/acpi/tables/MSDM"):
+                      try: k = open("/sys/firmware/acpi/tables/MSDM", "rb").read()[-29:].decode("ascii", errors="ignore").strip()
+                      except: pass
+                  self.l_lic.setText(f"<b>Klucz OEM w BIOS (MSDM):</b> {k}")
+                  devs = []
+                  try:
+                      for l in subprocess.check_output("lspci -nn", shell=True).decode().splitlines():
+                          m = re.search(r"^([0-9a-f:\.]+)\s+(.*?):\s+(.*?)\s+\[([0-9a-f]{4}):([0-9a-f]{4})\]", l, re.I)
+                          if m: devs.append((m.group(3).strip(), f"PCI\\VEN_{m.group(4).upper()}&DEV_{m.group(5).upper()}"))
+                  except: pass
+                  self.tb_d.setRowCount(len(devs))
+                  for r, (d, hid) in enumerate(devs):
+                      self.tb_d.setItem(r, 0, QTableWidgetItem(d))
+                      self.tb_d.setItem(r, 1, QTableWidgetItem(hid))
 
           if __name__ == "__main__":
-              a = QApplication(sys.argv)
-              w = App()
-              w.show()
-              sys.exit(a.exec())
+              app = QApplication(sys.argv)
+              win = ArbuzGUI()
+              win.show()
+              sys.exit(app.exec())
           EOF
 
+          # Budowanie ISO
           sudo lb build
-          sudo mv live-image-amd64.hybrid.iso ArbuzSerwis.iso
+          sudo mv live-image-amd64*.iso ArbuzSerwis.iso 2>/dev/null || sudo mv *.iso ArbuzSerwis.iso 2>/dev/null
+          sudo chmod 644 ArbuzSerwis.iso
 
       - name: Udostępnij plik ISO do pobrania
         uses: actions/upload-artifact@v4
