@@ -7,35 +7,27 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Inicjalizacja katalogu roboczego
-        uses: actions/checkout@v4
-
-      - name: Przygotowanie skryptu budującego
+      - name: Instalacja narzedzi
         run: |
-          mkdir -p workspace output
-          cat << 'SCRIPT' > workspace/build.sh
-          #!/bin/bash
-          set -e
+          sudo apt update
+          sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+            live-build debootstrap isolinux syslinux-common xorriso debian-archive-keyring
 
-          echo "=== 1. Instalacja narzedzi w Debianie ==="
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            live-build debootstrap isolinux xorriso squashfs-tools
+      - name: Konfiguracja i budowanie Arbuz Serwis
+        run: |
+          mkdir -p ~/arbuz_build && cd ~/arbuz_build
 
-          mkdir -p /root/iso_build && cd /root/iso_build
-
-          echo "=== 2. Konfiguracja obrazu ISO ==="
-          lb config \
+          # Konfiguracja bazowa (domyślny bootloader tworzy hybrydowy obraz BIOS+UEFI)
+          sudo lb config \
             --distribution bookworm \
             --architecture amd64 \
             --archive-areas "main contrib non-free non-free-firmware" \
-            --bootappend-live "boot=live components locales=pl_PL.UTF-8 keyboard-layouts=pl username=root autologin"
+            --linux-packages "linux-image" \
+            --system live
 
-          mkdir -p config/package-lists
-          cat << 'PKGS' > config/package-lists/arbuz.list.chroot
-          linux-image-amd64
-          live-boot
-          live-config
+          # Lista pakietów
+          sudo mkdir -p config/package-lists
+          cat << 'EOF' | sudo tee config/package-lists/serwis.list.chroot
           firmware-linux
           firmware-linux-nonfree
           smartmontools
@@ -74,15 +66,20 @@ jobs:
           unclutter
           python3
           python3-pyqt6
-          PKGS
+          EOF
 
-          echo "=== 3. Konfiguracja autostartu i Kiosku ==="
-          mkdir -p config/includes.chroot/root config/includes.chroot/opt/arbuz
+          # Struktura katalogów
+          sudo mkdir -p config/includes.chroot/root config/includes.chroot/opt/arbuz
 
-          echo 'if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then exec startx; fi' > config/includes.chroot/root/.bash_profile
+          # Autostart serwera X
+          cat << 'EOF' | sudo tee config/includes.chroot/root/.bash_profile
+          if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+              exec startx
+          fi
+          EOF
 
-          cat << 'XINIT' > config/includes.chroot/root/.xinitrc
-          #!/bin/sh
+          # Autostart Kiosku
+          cat << 'EOF' | sudo tee config/includes.chroot/root/.xinitrc
           xset -dpms
           xset s off
           unclutter -idle 3 &
@@ -90,11 +87,10 @@ jobs:
           mkdir -p /media/ARBUZ_DATA/Pobrane
           cd /opt/arbuz
           python3 /opt/arbuz/arbuz_app.py
-          XINIT
-          chmod +x config/includes.chroot/root/.xinitrc
+          EOF
 
-          echo "=== 4. Tworzenie aplikacji diagnostycznej Arbuz Serwis ==="
-          cat << 'PYAPP' > config/includes.chroot/opt/arbuz/arbuz_app.py
+          # Pelny kod aplikacji Arbuz Serwis (Wsparcie Windows, Linux, Diagnoza, Hasla)
+          cat << 'EOF' | sudo tee config/includes.chroot/opt/arbuz/arbuz_app.py
           import sys, os, subprocess, re
           from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                                        QVBoxLayout, QLabel, QPushButton, QStackedWidget, 
@@ -141,7 +137,7 @@ jobs:
                           else: new_l.append(l)
                       open(sf, "w").writelines(new_l)
                       subprocess.run("sync", shell=True)
-                      return True, f"Hasło dla {user} skasowane pomyślnie."
+                      return True, f"Hasło dla {user} w Linuksie skasowane pomyślnie."
                   elif target["type"] == "WINDOWS":
                       sam = os.path.join(target["mount"], "Windows/System32/config/SAM")
                       p = subprocess.Popen(["chntpw", "-u", user, sam], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -160,7 +156,7 @@ jobs:
                       if ed > 0 and ef > 0:
                           w = round((1 - (ef/ed))*100, 1)
                           if w >= 50: tips.append(("CRITICAL", "Bateria: Skrajne zużycie ogniw", f"Poziom zużycia: {w}%. Ryzyko spuchnięcia. Wymień baterię."))
-                          elif w >= 30: tips.append(("WARNING", "Bateria: Zużyta", f"Poziom zużycia: {w}%. Skrócony czas pracy na akumulatorze."))
+                          elif w >= 30: tips.append(("WARNING", "Bateria: Wyeksploatowana", f"Poziom zużycia: {w}%. Skrócony czas pracy na akumulatorze."))
                           else: tips.append(("OK", "Bateria: Sprawna", f"Poziom zużycia: {w}%."))
                   try:
                       ls = subprocess.check_output("lsblk -dno NAME,TYPE", shell=True).decode()
@@ -193,6 +189,7 @@ jobs:
                   cw = QWidget(); self.setCentralWidget(cw)
                   root = QVBoxLayout(cw); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
 
+                  # Top bar (Multi-OS)
                   tb = QWidget(); tb.setStyleSheet("background: #121820; border-bottom: 1px solid #1f2733; padding: 6px;")
                   tbl = QHBoxLayout(tb)
                   tbl.addWidget(QLabel("🎯 <b>SYSTEM DO NAPRAWY:</b>"))
@@ -207,6 +204,7 @@ jobs:
                   tbl.addStretch()
                   root.addWidget(tb)
 
+                  # Body
                   b = QWidget(); bl = QHBoxLayout(b); bl.setContentsMargins(0,0,0,0); bl.setSpacing(0)
                   side = QWidget(); side.setFixedWidth(240); side.setStyleSheet("background: #0e1217; border-right: 1px solid #1f2733;")
                   sl = QVBoxLayout(side)
@@ -365,28 +363,15 @@ jobs:
               win = ArbuzGUI()
               win.show()
               sys.exit(app.exec())
-          PYAPP
+          EOF
 
-          echo "=== 5. Start kompilacji ISO ==="
-          lb build
-
-          cp live-image-amd64*.iso /output/ArbuzSerwis.iso
-          chmod 666 /output/ArbuzSerwis.iso
-          echo "Kompilacja zakończona sukcesem!"
-          SCRIPT
-
-          chmod +x workspace/build.sh
-
-      - name: Uruchomienie kompilacji w kontenerze Debian Bookworm
-        run: |
-          docker run --rm --privileged \
-            -v ${{ github.workspace }}/workspace/build.sh:/build.sh \
-            -v ${{ github.workspace }}/output:/output \
-            debian:bookworm /build.sh
+          # Budowanie ISO
+          sudo lb build
+          sudo mv live-image-amd64*.iso ArbuzSerwis.iso 2>/dev/null || sudo mv *.iso ArbuzSerwis.iso 2>/dev/null
+          sudo chmod 644 ArbuzSerwis.iso
 
       - name: Udostępnij plik ISO do pobrania
         uses: actions/upload-artifact@v4
         with:
           name: ArbuzSerwis-ISO
-          path: output/ArbuzSerwis.iso
-          retention-days: 7
+          path: ~/arbuz_build/ArbuzSerwis.iso
